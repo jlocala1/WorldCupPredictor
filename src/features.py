@@ -130,6 +130,36 @@ def add_trailing_form(df: pd.DataFrame, window: int = 10) -> pd.DataFrame:
     return df
 
 
+def add_fifa_rank(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge home/away FIFA rank as of the closest preceding ranking publication.
+
+    The cashncarry CSV holds 333 ranking dates from 1992-12-31 to 2024-06-20, so
+    matches after 2024-06 fall back to the latest available snapshot (a known
+    staleness limitation we accept, see CLAUDE.md).
+    """
+    rank = pd.read_csv(DATA_RAW / "fifa_ranking-2024-06-20.csv", parse_dates=["rank_date"])
+    rank["country_full"] = rank["country_full"].map(to_canonical)
+    rank = rank.rename(columns={"country_full": "team", "rank_date": "date", "rank": "fifa_rank"})
+    rank = rank[["team", "date", "fifa_rank"]].dropna(subset=["team"]).sort_values(["date", "team"])
+
+    df = df.sort_values("date").reset_index(drop=True)
+
+    home_rank = rank.rename(columns={"team": "home_team", "fifa_rank": "home_fifa_rank"})
+    df = pd.merge_asof(
+        df, home_rank, on="date", by="home_team",
+        direction="backward", allow_exact_matches=True,
+    )
+
+    away_rank = rank.rename(columns={"team": "away_team", "fifa_rank": "away_fifa_rank"})
+    df = pd.merge_asof(
+        df, away_rank, on="date", by="away_team",
+        direction="backward", allow_exact_matches=True,
+    )
+
+    df["fifa_rank_diff"] = df["home_fifa_rank"] - df["away_fifa_rank"]
+    return df
+
+
 def add_elo(df: pd.DataFrame) -> pd.DataFrame:
     """Attach pre-match Elo ratings (and their difference) for both sides.
 
@@ -185,6 +215,7 @@ def main() -> None:
     df = add_trailing_form(df, window=10)
     df = add_h2h(df)
     df = add_elo(df)
+    df = add_fifa_rank(df)
 
     print(f"Total matches:        {len(df):,}")
     print(f"Date range:           {df['date'].min().date()} -> {df['date'].max().date()}")
@@ -219,7 +250,11 @@ def main() -> None:
         print(f"Teams: {', '.join(wc_teams)}")
 
     print("\nFeature coverage (% non-null) by split:")
-    feature_cols = [c for c in df.columns if c.startswith(("home_form_", "away_form_", "home_h2h_", "home_elo", "away_elo", "elo_"))]
+    feature_cols = [c for c in df.columns if c.startswith((
+        "home_form_", "away_form_", "home_h2h_",
+        "home_elo", "away_elo", "elo_",
+        "home_fifa_", "away_fifa_", "fifa_",
+    ))]
     for split in ["train", "val", "test", "predict"]:
         sub = df[df["split"] == split]
         if not len(sub):
@@ -245,8 +280,10 @@ def main() -> None:
     sample = df[(df["split"] == "predict") & ((df["home_team"] == "Brazil") | (df["away_team"] == "Brazil"))]
     for _, r in sample.iterrows():
         h2h_str = f"{r['home_h2h_win_rate']:.2f}" if pd.notna(r["home_h2h_win_rate"]) else "first mtg"
-        print(f"  {r['date'].date()}  {r['home_team']:<25} vs {r['away_team']:<25} "
-              f"elos={r['home_elo']:.0f}/{r['away_elo']:.0f}  diff={r['elo_diff']:+.0f}  h2h={h2h_str}")
+        rank_h = f"#{int(r['home_fifa_rank'])}" if pd.notna(r["home_fifa_rank"]) else "—"
+        rank_a = f"#{int(r['away_fifa_rank'])}" if pd.notna(r["away_fifa_rank"]) else "—"
+        print(f"  {r['date'].date()}  {r['home_team']:<25} ({rank_h}) vs {r['away_team']:<25} ({rank_a})  "
+              f"elo_diff={r['elo_diff']:+.0f}  h2h={h2h_str}")
 
     out = DATA_PROCESSED / "features.csv"
     df.to_csv(out, index=False)

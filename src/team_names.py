@@ -21,6 +21,8 @@ ALIASES: dict[str, str] = {
     "Côte d'Ivoire": "Ivory Coast",
     "Czechia": "Czech Republic",
     "IR Iran": "Iran",
+    "Cabo Verde": "Cape Verde",
+    "Curacao": "Curaçao",
 
     # davidcariboo countries.csv
     "Korea, South": "South Korea",
