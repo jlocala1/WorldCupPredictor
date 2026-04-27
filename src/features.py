@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from elo import compute_pre_match_elo
 from team_names import to_canonical
 
 DATA_RAW = Path(__file__).resolve().parents[1] / "data" / "raw"
@@ -129,6 +130,29 @@ def add_trailing_form(df: pd.DataFrame, window: int = 10) -> pd.DataFrame:
     return df
 
 
+def add_elo(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach pre-match Elo ratings (and their difference) for both sides.
+
+    Elo is computed over the FULL results.csv history (1872+) so that ratings
+    by 2010 already reflect decades of prior results. K-factor varies by
+    tournament type and home advantage is applied for non-neutral games — see
+    src/elo.py for the full eloratings.net formula.
+    """
+    full = pd.read_csv(DATA_RAW / "results.csv", parse_dates=["date"])
+    full["home_team"] = full["home_team"].map(to_canonical)
+    full["away_team"] = full["away_team"].map(to_canonical)
+    full["neutral"] = full["neutral"].astype(bool)
+
+    full_elo = compute_pre_match_elo(full)
+    elo_lookup = full_elo[["date", "home_team", "away_team", "home_elo_pre", "away_elo_pre"]].rename(
+        columns={"home_elo_pre": "home_elo", "away_elo_pre": "away_elo"}
+    )
+
+    df = df.merge(elo_lookup, on=["date", "home_team", "away_team"], how="left")
+    df["elo_diff"] = df["home_elo"] - df["away_elo"]
+    return df
+
+
 def add_h2h(df: pd.DataFrame) -> pd.DataFrame:
     """Add the home team's prior win rate against the away team across all earlier meetings.
 
@@ -160,6 +184,7 @@ def main() -> None:
     df = load_base_frame()
     df = add_trailing_form(df, window=10)
     df = add_h2h(df)
+    df = add_elo(df)
 
     print(f"Total matches:        {len(df):,}")
     print(f"Date range:           {df['date'].min().date()} -> {df['date'].max().date()}")
@@ -194,7 +219,7 @@ def main() -> None:
         print(f"Teams: {', '.join(wc_teams)}")
 
     print("\nFeature coverage (% non-null) by split:")
-    feature_cols = [c for c in df.columns if c.startswith(("home_form_", "away_form_", "home_h2h_"))]
+    feature_cols = [c for c in df.columns if c.startswith(("home_form_", "away_form_", "home_h2h_", "home_elo", "away_elo", "elo_"))]
     for split in ["train", "val", "test", "predict"]:
         sub = df[df["split"] == split]
         if not len(sub):
@@ -202,12 +227,26 @@ def main() -> None:
         coverage = {c: f"{sub[c].notna().mean():.0%}" for c in feature_cols}
         print(f"  {split:<7} {coverage}")
 
+    print("\nTop 10 Elo ratings going into the 2026 WC (latest known per team):")
+    predict = df[df["split"] == "predict"].copy()
+    if len(predict):
+        latest = pd.concat([
+            predict[["home_team", "home_elo"]].rename(columns={"home_team": "team", "home_elo": "elo"}),
+            predict[["away_team", "away_elo"]].rename(columns={"away_team": "team", "away_elo": "elo"}),
+        ]).drop_duplicates("team").sort_values("elo", ascending=False)
+        for _, r in latest.head(10).iterrows():
+            print(f"  {r['team']:<25} {r['elo']:.0f}")
+        print("  ...")
+        print(f"  Bottom 3 of WC field:")
+        for _, r in latest.tail(3).iterrows():
+            print(f"  {r['team']:<25} {r['elo']:.0f}")
+
     print("\nSample predict-split rows (Brazil's matches):")
     sample = df[(df["split"] == "predict") & ((df["home_team"] == "Brazil") | (df["away_team"] == "Brazil"))]
     for _, r in sample.iterrows():
+        h2h_str = f"{r['home_h2h_win_rate']:.2f}" if pd.notna(r["home_h2h_win_rate"]) else "first mtg"
         print(f"  {r['date'].date()}  {r['home_team']:<25} vs {r['away_team']:<25} "
-              f"home_form_wr={r['home_form_win_rate']:.2f}  away_form_wr={r['away_form_win_rate']:.2f}  "
-              f"h2h_wr={r['home_h2h_win_rate'] if pd.notna(r['home_h2h_win_rate']) else 'first meeting'}")
+              f"elos={r['home_elo']:.0f}/{r['away_elo']:.0f}  diff={r['elo_diff']:+.0f}  h2h={h2h_str}")
 
     out = DATA_PROCESSED / "features.csv"
     df.to_csv(out, index=False)
