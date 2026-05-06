@@ -6,6 +6,7 @@ __pycache__/
 .env
 *.csv
 *.xlsx
+*.zip
 CLAUDE.md
 .claude/
 .DS_Store
