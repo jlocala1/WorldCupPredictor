@@ -19,6 +19,7 @@ ALIASES: dict[str, str] = {
     "Korea DPR": "North Korea",
     "Congo DR": "DR Congo",
     "Côte d'Ivoire": "Ivory Coast",
+    "Cote d'Ivoire": "Ivory Coast",
     "Czechia": "Czech Republic",
     "IR Iran": "Iran",
     "Cabo Verde": "Cape Verde",

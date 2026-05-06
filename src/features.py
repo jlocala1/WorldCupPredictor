@@ -160,6 +160,125 @@ def add_fifa_rank(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_squad_value(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach home/away squad value features (total, top-26, avg, size).
+
+    Squad cohort comes from playerstransfer: every player with international_caps > 0
+    whose country_of_citizenship (canonicalized) matches the team. This is a CURRENT
+    snapshot of each team's player pool — the original CLAUDE.md plan was to use
+    historical national-team appearances, but davidcariboo's appearances.csv has only
+    ~776 national-team rows (all AFCON 2025), so per-match historical cohorts aren't
+    recoverable.
+
+    Per-player values DO use match-date lookups via merge_asof on player_valuations.
+    So a 2014 Brazil match gets the 2026 Brazil cohort valued *as of 2014* —
+    anachronistic in roster but date-correct in valuation. Documented in DATA.md /
+    final report.
+    """
+    # Players: keep those with at least one international cap, citizenship as string match
+    players = pd.read_csv(
+        DATA_RAW / "playerstransfer.csv",
+        usecols=["player_id", "country_of_citizenship", "international_caps"],
+    )
+    players["country_of_citizenship"] = players["country_of_citizenship"].map(
+        to_canonical, na_action="ignore"
+    )
+    players = players[players["international_caps"].fillna(0) > 0]
+    players = players.dropna(subset=["country_of_citizenship"])
+    players = players[["player_id", "country_of_citizenship"]].rename(
+        columns={"country_of_citizenship": "team"}
+    )
+
+    # (team, match_date) keys for both sides
+    home_keys = df[["date", "home_team"]].rename(columns={"home_team": "team", "date": "match_date"})
+    away_keys = df[["date", "away_team"]].rename(columns={"away_team": "team", "date": "match_date"})
+    match_keys = pd.concat([home_keys, away_keys]).drop_duplicates().reset_index(drop=True)
+
+    # Cohort: every (team, match_date, player_id) where player's citizenship == team
+    cohort = match_keys.merge(players, on="team", how="inner")[
+        ["team", "match_date", "player_id"]
+    ]
+
+    # Per-player value at match_date via backward merge_asof on player_valuations.
+    valuations = pd.read_csv(
+        DATA_RAW / "player_valuations.csv",
+        usecols=["player_id", "date", "market_value_in_eur"],
+        parse_dates=["date"],
+    ).sort_values("date").reset_index(drop=True)
+
+    cohort = cohort.sort_values("match_date").reset_index(drop=True)
+    cohort = pd.merge_asof(
+        cohort, valuations,
+        left_on="match_date", right_on="date",
+        by="player_id",
+        direction="backward",
+    ).drop(columns="date")
+    cohort = cohort.dropna(subset=["market_value_in_eur"])
+
+    # Aggregate per (team, match_date)
+    def top26_sum(values: pd.Series) -> float:
+        return float(values.nlargest(26).sum())
+
+    agg = cohort.groupby(["team", "match_date"], sort=False).agg(
+        squad_value=("market_value_in_eur", "sum"),
+        top26_value=("market_value_in_eur", top26_sum),
+        avg_value=("market_value_in_eur", "mean"),
+        squad_size=("market_value_in_eur", "count"),
+    ).reset_index()
+
+    home_agg = agg.rename(columns={
+        "team": "home_team", "match_date": "date",
+        "squad_value": "home_squad_value", "top26_value": "home_top26_value",
+        "avg_value": "home_avg_value", "squad_size": "home_squad_size",
+    })
+    df = df.merge(home_agg, on=["home_team", "date"], how="left")
+
+    away_agg = agg.rename(columns={
+        "team": "away_team", "match_date": "date",
+        "squad_value": "away_squad_value", "top26_value": "away_top26_value",
+        "avg_value": "away_avg_value", "squad_size": "away_squad_size",
+    })
+    df = df.merge(away_agg, on=["away_team", "date"], how="left")
+
+    df["squad_value_diff"] = df["home_squad_value"] - df["away_squad_value"]
+    df["top26_value_diff"] = df["home_top26_value"] - df["away_top26_value"]
+    return df
+
+
+def add_caps(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach home/away avg international caps per player on each team.
+
+    Cohort matches add_squad_value (citizens with caps > 0). caps come from
+    playerstransfer.international_caps which is a CURRENT-snapshot total
+    rather than caps-as-of-match-date — so for a 2014 match, a player who
+    has 80 caps now contributes 80 even if they had only 15 in 2014.
+    Anachronistic; documented as a known limitation.
+    """
+    players = pd.read_csv(
+        DATA_RAW / "playerstransfer.csv",
+        usecols=["country_of_citizenship", "international_caps"],
+    )
+    players["country_of_citizenship"] = players["country_of_citizenship"].map(
+        to_canonical, na_action="ignore"
+    )
+    players = players[players["international_caps"].fillna(0) > 0]
+    players = players.dropna(subset=["country_of_citizenship"])
+
+    team_caps = players.groupby("country_of_citizenship").agg(
+        avg_caps=("international_caps", "mean"),
+    ).reset_index().rename(columns={"country_of_citizenship": "team"})
+
+    df = df.merge(
+        team_caps.rename(columns={"team": "home_team", "avg_caps": "home_avg_caps"}),
+        on="home_team", how="left",
+    )
+    df = df.merge(
+        team_caps.rename(columns={"team": "away_team", "avg_caps": "away_avg_caps"}),
+        on="away_team", how="left",
+    )
+    return df
+
+
 def add_elo(df: pd.DataFrame) -> pd.DataFrame:
     """Attach pre-match Elo ratings (and their difference) for both sides.
 
@@ -216,6 +335,8 @@ def main() -> None:
     df = add_h2h(df)
     df = add_elo(df)
     df = add_fifa_rank(df)
+    df = add_squad_value(df)
+    df = add_caps(df)
 
     print(f"Total matches:        {len(df):,}")
     print(f"Date range:           {df['date'].min().date()} -> {df['date'].max().date()}")
@@ -254,6 +375,10 @@ def main() -> None:
         "home_form_", "away_form_", "home_h2h_",
         "home_elo", "away_elo", "elo_",
         "home_fifa_", "away_fifa_", "fifa_",
+        "home_squad_", "away_squad_", "squad_value_",
+        "home_top26_", "away_top26_", "top26_value_",
+        "home_avg_value", "away_avg_value",
+        "home_avg_caps", "away_avg_caps",
     ))]
     for split in ["train", "val", "test", "predict"]:
         sub = df[df["split"] == split]
@@ -275,6 +400,28 @@ def main() -> None:
         print(f"  Bottom 3 of WC field:")
         for _, r in latest.tail(3).iterrows():
             print(f"  {r['team']:<25} {r['elo']:.0f}")
+
+    print("\nTop 10 squad value (€) going into the 2026 WC (latest known per team):")
+    if len(predict):
+        latest_sv = pd.concat([
+            predict[["home_team", "home_squad_value", "home_top26_value", "home_squad_size"]].rename(
+                columns={"home_team": "team", "home_squad_value": "sv", "home_top26_value": "top26", "home_squad_size": "n"}
+            ),
+            predict[["away_team", "away_squad_value", "away_top26_value", "away_squad_size"]].rename(
+                columns={"away_team": "team", "away_squad_value": "sv", "away_top26_value": "top26", "away_squad_size": "n"}
+            ),
+        ]).drop_duplicates("team").sort_values("sv", ascending=False)
+        for _, r in latest_sv.head(10).iterrows():
+            sv_str = f"{r['sv']/1e6:>6.0f}M" if pd.notna(r["sv"]) else "    —"
+            top_str = f"{r['top26']/1e6:>6.0f}M" if pd.notna(r["top26"]) else "    —"
+            n_str = f"{int(r['n'])}" if pd.notna(r["n"]) else "—"
+            print(f"  {r['team']:<25} squad={sv_str}  top26={top_str}  n={n_str}")
+        print(f"\n  Bottom 5 of WC field:")
+        for _, r in latest_sv.tail(5).iterrows():
+            sv_str = f"{r['sv']/1e6:>6.0f}M" if pd.notna(r["sv"]) else "    —"
+            top_str = f"{r['top26']/1e6:>6.0f}M" if pd.notna(r["top26"]) else "    —"
+            n_str = f"{int(r['n'])}" if pd.notna(r["n"]) else "—"
+            print(f"  {r['team']:<25} squad={sv_str}  top26={top_str}  n={n_str}")
 
     print("\nSample predict-split rows (Brazil's matches):")
     sample = df[(df["split"] == "predict") & ((df["home_team"] == "Brazil") | (df["away_team"] == "Brazil"))]
