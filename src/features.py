@@ -160,46 +160,51 @@ def add_fifa_rank(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_squad_value(df: pd.DataFrame) -> pd.DataFrame:
-    """Attach home/away squad value features (total, top-26, avg, size).
+def _build_tournament_cohort(df: pd.DataFrame, window_years: int = 4,
+                             forward_years: int = 1) -> pd.DataFrame:
+    """Per (team, match_date), the cohort = unique players who appeared in any
+    tournament_squads.csv tournament with date in (match_date - window_years,
+    match_date + forward_years).
 
-    Squad cohort comes from playerstransfer: every player with international_caps > 0
-    whose country_of_citizenship (canonicalized) matches the team. This is a CURRENT
-    snapshot of each team's player pool — the original CLAUDE.md plan was to use
-    historical national-team appearances, but davidcariboo's appearances.csv has only
-    ~776 national-team rows (all AFCON 2025), so per-match historical cohorts aren't
-    recoverable.
-
-    Per-player values DO use match-date lookups via merge_asof on player_valuations.
-    So a 2014 Brazil match gets the 2026 Brazil cohort valued *as of 2014* —
-    anachronistic in roster but date-correct in valuation. Documented in DATA.md /
-    final report.
+    Returns DataFrame with columns: team, match_date, player_id.
+    Teams with no tournament-squad data get no cohort rows (NaN downstream).
     """
-    # Players: keep those with at least one international cap, citizenship as string match
-    players = pd.read_csv(
-        DATA_RAW / "playerstransfer.csv",
-        usecols=["player_id", "country_of_citizenship", "international_caps"],
-    )
-    players["country_of_citizenship"] = players["country_of_citizenship"].map(
-        to_canonical, na_action="ignore"
-    )
-    players = players[players["international_caps"].fillna(0) > 0]
-    players = players.dropna(subset=["country_of_citizenship"])
-    players = players[["player_id", "country_of_citizenship"]].rename(
-        columns={"country_of_citizenship": "team"}
+    ts = pd.read_csv(DATA_RAW / "tournament_squads.csv", parse_dates=["tournament_date"])
+    ts["team_canon"] = ts["team_name"].map(to_canonical, na_action="ignore")
+    ts = ts.dropna(subset=["team_canon"])
+    ts = ts[["team_canon", "tournament_date", "player_id"]].rename(
+        columns={"team_canon": "team"}
     )
 
-    # (team, match_date) keys for both sides
     home_keys = df[["date", "home_team"]].rename(columns={"home_team": "team", "date": "match_date"})
     away_keys = df[["date", "away_team"]].rename(columns={"away_team": "team", "date": "match_date"})
     match_keys = pd.concat([home_keys, away_keys]).drop_duplicates().reset_index(drop=True)
 
-    # Cohort: every (team, match_date, player_id) where player's citizenship == team
-    cohort = match_keys.merge(players, on="team", how="inner")[
-        ["team", "match_date", "player_id"]
+    cohort = match_keys.merge(ts, on="team", how="inner")
+    backward = pd.Timedelta(days=window_years * 365)
+    forward = pd.Timedelta(days=forward_years * 365)
+    cohort = cohort[
+        (cohort["tournament_date"] > cohort["match_date"] - backward)
+        & (cohort["tournament_date"] < cohort["match_date"] + forward)
     ]
+    return cohort[["team", "match_date", "player_id"]].drop_duplicates().reset_index(drop=True)
 
-    # Per-player value at match_date via backward merge_asof on player_valuations.
+
+def add_squad_value(df: pd.DataFrame) -> pd.DataFrame:
+    """Date-correct squad value features per CLAUDE.md spec.
+
+    Cohort: per (team, match_date), players who appeared for that team in any
+    scraped major tournament (WC, Euro, Copa, AFCON, Asian Cup, Gold Cup, OFC
+    Nations Cup, Confederations Cup) within (D-4yr, D+1yr).
+    Per-player value: looked up from player_valuations.csv at the match date
+    via backward merge_asof. So a 2014 Brazil match uses the 2014-era Brazil
+    squad valued in 2014.
+
+    Adds: home/away_squad_value, home/away_top26_value, home/away_avg_value,
+          home/away_squad_size, plus squad_value_diff and top26_value_diff.
+    """
+    cohort = _build_tournament_cohort(df)
+
     valuations = pd.read_csv(
         DATA_RAW / "player_valuations.csv",
         usecols=["player_id", "date", "market_value_in_eur"],
@@ -215,7 +220,6 @@ def add_squad_value(df: pd.DataFrame) -> pd.DataFrame:
     ).drop(columns="date")
     cohort = cohort.dropna(subset=["market_value_in_eur"])
 
-    # Aggregate per (team, match_date)
     def top26_sum(values: pd.Series) -> float:
         return float(values.nlargest(26).sum())
 
@@ -246,36 +250,28 @@ def add_squad_value(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_caps(df: pd.DataFrame) -> pd.DataFrame:
-    """Attach home/away avg international caps per player on each team.
+    """Avg international caps over the date-correct tournament cohort.
 
-    Cohort matches add_squad_value (citizens with caps > 0). caps come from
-    playerstransfer.international_caps which is a CURRENT-snapshot total
-    rather than caps-as-of-match-date — so for a 2014 match, a player who
-    has 80 caps now contributes 80 even if they had only 15 in 2014.
-    Anachronistic; documented as a known limitation.
+    Note: caps come from playerstransfer.international_caps (a CURRENT-snapshot
+    total), so cap *numbers* are still anachronistic for older matches even
+    though the *cohort* is now date-correct. Documented limitation.
     """
+    cohort = _build_tournament_cohort(df)
+
     players = pd.read_csv(
         DATA_RAW / "playerstransfer.csv",
-        usecols=["country_of_citizenship", "international_caps"],
-    )
-    players["country_of_citizenship"] = players["country_of_citizenship"].map(
-        to_canonical, na_action="ignore"
-    )
-    players = players[players["international_caps"].fillna(0) > 0]
-    players = players.dropna(subset=["country_of_citizenship"])
+        usecols=["player_id", "international_caps"],
+    ).dropna(subset=["international_caps"])
 
-    team_caps = players.groupby("country_of_citizenship").agg(
+    cohort = cohort.merge(players, on="player_id", how="inner")
+    agg = cohort.groupby(["team", "match_date"], sort=False).agg(
         avg_caps=("international_caps", "mean"),
-    ).reset_index().rename(columns={"country_of_citizenship": "team"})
+    ).reset_index()
 
-    df = df.merge(
-        team_caps.rename(columns={"team": "home_team", "avg_caps": "home_avg_caps"}),
-        on="home_team", how="left",
-    )
-    df = df.merge(
-        team_caps.rename(columns={"team": "away_team", "avg_caps": "away_avg_caps"}),
-        on="away_team", how="left",
-    )
+    home = agg.rename(columns={"team": "home_team", "match_date": "date", "avg_caps": "home_avg_caps"})
+    df = df.merge(home, on=["home_team", "date"], how="left")
+    away = agg.rename(columns={"team": "away_team", "match_date": "date", "avg_caps": "away_avg_caps"})
+    df = df.merge(away, on=["away_team", "date"], how="left")
     return df
 
 

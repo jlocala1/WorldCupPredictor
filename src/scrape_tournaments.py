@@ -105,6 +105,23 @@ TOURNAMENTS: list[Tournament] = [
     Tournament("AS2015",  "Asian Cup 2015",       "AFAC", 2014, "2015-01-09"),
     Tournament("AS2019",  "Asian Cup 2019",       "AFAC", 2018, "2019-01-05"),
     Tournament("AS2023",  "Asian Cup 2023",       "AFAC", 2022, "2024-01-12"),
+    # --- CONCACAF Gold Cup (covers USA / Mexico / Canada / Panama / Haiti / Curaçao) ---
+    Tournament("GC2007",  "Gold Cup 2007",        "GOCU", 2006, "2007-06-06"),
+    Tournament("GC2009",  "Gold Cup 2009",        "GOCU", 2008, "2009-07-03"),
+    Tournament("GC2011",  "Gold Cup 2011",        "GOCU", 2010, "2011-06-05"),
+    Tournament("GC2013",  "Gold Cup 2013",        "GOCU", 2012, "2013-07-07"),
+    Tournament("GC2015",  "Gold Cup 2015",        "GOCU", 2014, "2015-07-07"),
+    Tournament("GC2017",  "Gold Cup 2017",        "GOCU", 2016, "2017-07-07"),
+    Tournament("GC2019",  "Gold Cup 2019",        "GOCU", 2018, "2019-06-15"),
+    Tournament("GC2021",  "Gold Cup 2021",        "GOCU", 2020, "2021-07-10"),
+    Tournament("GC2023",  "Gold Cup 2023",        "GOCU", 2022, "2023-06-24"),
+    Tournament("GC2025",  "Gold Cup 2025",        "GOCU", 2024, "2025-06-14"),
+    # --- OFC Nations Cup (covers New Zealand) ---
+    Tournament("ON2024",  "OFC Nations Cup 2024", "OFCN", 2023, "2024-06-15"),
+    # --- Confederations Cup (discontinued 2017) ---
+    Tournament("CC2009",  "Confederations Cup 2009", "CONC", 2008, "2009-06-14"),
+    Tournament("CC2013",  "Confederations Cup 2013", "CONC", 2012, "2013-06-15"),
+    Tournament("CC2017",  "Confederations Cup 2017", "CONC", 2016, "2017-06-17"),
 ]
 
 
