@@ -15,6 +15,7 @@ output file. Run end-to-end with: python src/features.py
 
 from __future__ import annotations
 
+import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -249,6 +250,277 @@ def add_squad_value(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _normalize_player_name(name: str) -> str:
+    """Strip accents + lowercase + collapse whitespace for fuzzy matching."""
+    if not isinstance(name, str):
+        return ""
+    nfkd = unicodedata.normalize("NFKD", name)
+    no_accents = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return " ".join(no_accents.lower().split())
+
+
+def _z_score(series: pd.Series) -> pd.Series:
+    """Per-group population z-score (ddof=0). Used after groupby.transform."""
+    std = series.std(ddof=0)
+    return (series - series.mean()) / std if std and std > 0 else pd.Series(np.nan, index=series.index)
+
+
+def _fotmob_player_scores() -> pd.DataFrame:
+    """Per-player attacking_z + creating_z + defending_z from fotmob's data CDN.
+
+    Stats used (all per-90, normalized within (league) since fotmob current-
+    season covers many leagues with very different talent depth):
+      attacking_z = mean(goals_p90_z, xG_p90_z)
+      creating_z  = mean(assists_p90_z, xA_p90_z, big_chance_p90_z)
+      defending_z = mean(tackles_per90_z, int_per90_z, blocks_per90_z, recoveries_per90_z)
+
+    Coverage: Big 5 + MLS + Saudi Pro + Liga MX + Eredivisie + Liga Portugal +
+    Brasileirão + Belgian Pro. ~6,400 players.
+
+    Returns DataFrame keyed by `norm_name` with the three z-scores. Missing
+    fotmob CSV -> empty frame.
+    """
+    path = DATA_RAW / "fotmob_player_stats.csv"
+    if not path.exists():
+        return pd.DataFrame(columns=["norm_name", "attacking_z", "creating_z", "defending_z"])
+    fm = pd.read_csv(path)
+    fm = fm[fm["minutes"].fillna(0) >= 450].copy()
+    if fm.empty:
+        return pd.DataFrame(columns=["norm_name", "attacking_z", "creating_z", "defending_z"])
+
+    # Convert totals to per-90 for consistency with other stats
+    nineties = fm["minutes"] / 90.0
+    for src, dst in [("goals_total", "goals_p90"), ("assists_total", "assists_p90"),
+                     ("xG_total", "xG_p90"), ("xA_total", "xA_p90"),
+                     ("big_chance_total", "big_chance_p90")]:
+        if src in fm.columns:
+            fm[dst] = fm[src] / nineties
+
+    # Z-score every per-90 stat within (league) — current season, so no season grouping
+    grouped = fm.groupby("league", group_keys=False)
+    for stat in ["goals_p90", "assists_p90", "xG_p90", "xA_p90", "big_chance_p90",
+                 "tackles_per90", "int_per90", "blocks_per90", "recoveries_per90"]:
+        if stat in fm.columns:
+            fm[f"{stat}_z"] = grouped[stat].transform(_z_score)
+
+    def avg_z(*cols):
+        present = [fm[c] for c in cols if c in fm.columns]
+        if not present:
+            return pd.Series(np.nan, index=fm.index)
+        return pd.concat(present, axis=1).mean(axis=1)
+
+    fm["attacking_z"] = avg_z("goals_p90_z", "xG_p90_z")
+    fm["creating_z"] = avg_z("assists_p90_z", "xA_p90_z", "big_chance_p90_z")
+    fm["defending_z"] = avg_z("tackles_per90_z", "int_per90_z", "blocks_per90_z", "recoveries_per90_z")
+
+    fm["norm_name"] = fm["player_name"].map(_normalize_player_name)
+    # If a player appears in multiple leagues (loanee mid-season etc.), keep the
+    # row with most minutes — most representative of their level.
+    fm = fm.sort_values("minutes", ascending=False).drop_duplicates("norm_name")
+    return fm[["norm_name", "attacking_z", "creating_z", "defending_z"]].reset_index(drop=True)
+
+
+def _understat_player_scores() -> pd.DataFrame:
+    """Per-player attacking_z + creating_z (latest-season snapshot) from Understat.
+
+    Returns a DataFrame keyed by `norm_name` with columns attacking_z, creating_z.
+    Missing file -> empty frame.
+    """
+    path = DATA_RAW / "understat_player_stats.csv"
+    if not path.exists():
+        return pd.DataFrame(columns=["norm_name", "attacking_z", "creating_z"])
+    us = pd.read_csv(path)
+
+    # Filter players with at least 450 minutes (~5 full games)
+    us = us[us["time"].fillna(0) >= 450].copy()
+    if us.empty:
+        return pd.DataFrame(columns=["norm_name", "attacking_z", "creating_z"])
+
+    nineties = us["time"] / 90.0
+    for stat in ["goals", "xG", "npxG", "assists", "xA", "key_passes"]:
+        us[f"{stat}_p90"] = us[stat] / nineties
+
+    # Z-score each per-90 within (league, year) pool
+    grouped = us.groupby(["league", "year"], group_keys=False)
+    for stat in ["goals", "xG", "npxG", "assists", "xA", "key_passes"]:
+        us[f"{stat}_z"] = grouped[f"{stat}_p90"].transform(_z_score)
+
+    us["attacking_z"] = us[["goals_z", "xG_z", "npxG_z"]].mean(axis=1)
+    us["creating_z"] = us[["assists_z", "xA_z", "key_passes_z"]].mean(axis=1)
+
+    us["norm_name"] = us["player_name"].map(_normalize_player_name)
+
+    # Latest-season snapshot per player (anachronistic for older matches but
+    # consistent with our caps treatment — documented limitation)
+    return (
+        us.sort_values("year", ascending=False)
+        .drop_duplicates("norm_name")[["norm_name", "attacking_z", "creating_z"]]
+        .reset_index(drop=True)
+    )
+
+
+def _fbref_defending_scores() -> pd.DataFrame:
+    """Per-player defending_z (latest-season snapshot) from the fbref `misc` table.
+
+    Uses TklW + Int (per 90, z-scored within league+season). No total Tkl or
+    Blocks because fbref's public HTML strips them; this is the best signal we
+    can extract without a paid data feed.
+
+    Returns DataFrame keyed by `norm_name` with column defending_z. Missing
+    file -> empty frame.
+    """
+    path = DATA_RAW / "fbref_player_stats.csv"
+    if not path.exists():
+        return pd.DataFrame(columns=["norm_name", "defending_z"])
+    fb = pd.read_csv(path)
+
+    def find(*needles):
+        for col in fb.columns:
+            if all(n in col for n in needles):
+                return col
+        return None
+
+    min_col = find("Min")
+    tklw_col = find("TklW")
+    int_col = find("Int") or find("Performance_Int")
+    if not (min_col and tklw_col and int_col):
+        return pd.DataFrame(columns=["norm_name", "defending_z"])
+
+    fb = fb[fb[min_col].fillna(0) >= 450].copy()
+    if fb.empty:
+        return pd.DataFrame(columns=["norm_name", "defending_z"])
+
+    nineties = fb[min_col] / 90.0
+    fb["TklW_p90"] = fb[tklw_col] / nineties
+    fb["Int_p90"] = fb[int_col] / nineties
+
+    grouped = fb.groupby(["league", "season"], group_keys=False)
+    fb["TklW_z"] = grouped["TklW_p90"].transform(_z_score)
+    fb["Int_z"] = grouped["Int_p90"].transform(_z_score)
+    fb["defending_z"] = fb[["TklW_z", "Int_z"]].mean(axis=1)
+
+    fb["norm_name"] = fb["player"].map(_normalize_player_name)
+    return (
+        fb.sort_values("season", ascending=False)
+        .drop_duplicates("norm_name")[["norm_name", "defending_z"]]
+        .reset_index(drop=True)
+    )
+
+
+def add_position_zscores(df: pd.DataFrame) -> pd.DataFrame:
+    """Position-blind player skill z-scores aggregated to team level.
+
+    Composite scores per player (z-scored within their league-season):
+      attacking_z = mean(goals/90_z, xG/90_z, npxG/90_z)            [from Understat]
+      creating_z  = mean(assists/90_z, xA/90_z, key_passes/90_z)    [from Understat]
+      defending_z = mean(TklW/90_z, Int/90_z)                        [from fbref `misc` table]
+
+    Then per (team, match_date), team scores = mean of TOP 8 cohort players per
+    skill (best contributors regardless of nominal position; an attacking
+    fullback's elite creating_z counts toward the team's creating_z even though
+    fbref classifies them as DF).
+
+    Adds 9 columns: home/away_{attacking,creating,defending}_z + 3 diffs.
+
+    Limitations (documented in report):
+      - **No progressive passes / progressive carries** — fbref recently stripped
+        these from public HTML; Understat doesn't track them. We keep the marquee
+        modern attacking/creating metrics (xG, xA, npxG, KP) but not progression.
+      - **Latest-season snapshot per player.** A 2014 match uses each cohort
+        player's most-recent-Understat-season stats — anachronistic for older
+        matches but consistent with how we treat international caps.
+      - **Big 5 (+ RPL) only.** Players in MLS, Saudi, Liga MX, Brazilian Serie A,
+        J1, etc. don't have Understat coverage and contribute NaN. This will
+        underweight teams whose stars play outside Europe; the model can use
+        the squad-value features to compensate.
+      - If neither raw CSV exists yet, this function is a no-op (all NaN).
+    """
+    out_cols = ["home_attacking_z", "home_creating_z", "home_defending_z",
+                "away_attacking_z", "away_creating_z", "away_defending_z",
+                "attacking_z_diff", "creating_z_diff", "defending_z_diff"]
+
+    # Combine sources: fotmob first (12 leagues, full stats incl. defensive),
+    # fall back to Understat for retired/older players who may only appear in
+    # Understat's historical 2014-2024 Big 5 data, and fbref misc for defending
+    # values when neither covers a player.
+    fm = _fotmob_player_scores().rename(columns={
+        "attacking_z": "att_fm", "creating_z": "cre_fm", "defending_z": "def_fm"
+    })
+    us = _understat_player_scores().rename(columns={
+        "attacking_z": "att_us", "creating_z": "cre_us"
+    })
+    fb = _fbref_defending_scores().rename(columns={"defending_z": "def_fb"})
+
+    if fm.empty and us.empty and fb.empty:
+        for c in out_cols:
+            df[c] = np.nan
+        return df
+
+    bases = [d for d in [fm, us, fb] if not d.empty]
+    player_scores = bases[0]
+    for other in bases[1:]:
+        player_scores = player_scores.merge(other, on="norm_name", how="outer")
+
+    player_scores["attacking_z"] = (
+        player_scores.get("att_fm", pd.Series(np.nan)).combine_first(
+            player_scores.get("att_us", pd.Series(np.nan)))
+    )
+    player_scores["creating_z"] = (
+        player_scores.get("cre_fm", pd.Series(np.nan)).combine_first(
+            player_scores.get("cre_us", pd.Series(np.nan)))
+    )
+    player_scores["defending_z"] = (
+        player_scores.get("def_fm", pd.Series(np.nan)).combine_first(
+            player_scores.get("def_fb", pd.Series(np.nan)))
+    )
+    player_scores = player_scores[["norm_name", "attacking_z", "creating_z", "defending_z"]]
+
+    # Bridge tournament_squads (Transfermarkt player_ids + names) -> player scores
+    ts = pd.read_csv(DATA_RAW / "tournament_squads.csv", parse_dates=["tournament_date"])
+    ts["norm_name"] = ts["player_name"].map(_normalize_player_name)
+    bridge = (
+        ts[["player_id", "norm_name"]]
+        .drop_duplicates("player_id")
+        .merge(player_scores, on="norm_name", how="left")
+        .drop(columns="norm_name")
+    )
+
+    cohort = _build_tournament_cohort(df).merge(bridge, on="player_id", how="left")
+
+    def top_n_mean(series: pd.Series, n: int = 8) -> float:
+        clean = series.dropna()
+        if clean.empty:
+            return float("nan")
+        return float(clean.nlargest(n).mean())
+
+    agg = cohort.groupby(["team", "match_date"], sort=False).agg(
+        team_attacking_z=("attacking_z", top_n_mean),
+        team_creating_z=("creating_z", top_n_mean),
+        team_defending_z=("defending_z", top_n_mean),
+    ).reset_index()
+
+    home = agg.rename(columns={
+        "team": "home_team", "match_date": "date",
+        "team_attacking_z": "home_attacking_z",
+        "team_creating_z": "home_creating_z",
+        "team_defending_z": "home_defending_z",
+    })
+    df = df.merge(home, on=["home_team", "date"], how="left")
+
+    away = agg.rename(columns={
+        "team": "away_team", "match_date": "date",
+        "team_attacking_z": "away_attacking_z",
+        "team_creating_z": "away_creating_z",
+        "team_defending_z": "away_defending_z",
+    })
+    df = df.merge(away, on=["away_team", "date"], how="left")
+
+    df["attacking_z_diff"] = df["home_attacking_z"] - df["away_attacking_z"]
+    df["creating_z_diff"] = df["home_creating_z"] - df["away_creating_z"]
+    df["defending_z_diff"] = df["home_defending_z"] - df["away_defending_z"]
+    return df
+
+
 def add_caps(df: pd.DataFrame) -> pd.DataFrame:
     """Avg international caps over the date-correct tournament cohort.
 
@@ -333,6 +605,7 @@ def main() -> None:
     df = add_fifa_rank(df)
     df = add_squad_value(df)
     df = add_caps(df)
+    df = add_position_zscores(df)
 
     print(f"Total matches:        {len(df):,}")
     print(f"Date range:           {df['date'].min().date()} -> {df['date'].max().date()}")
@@ -375,6 +648,9 @@ def main() -> None:
         "home_top26_", "away_top26_", "top26_value_",
         "home_avg_value", "away_avg_value",
         "home_avg_caps", "away_avg_caps",
+        "home_attacking_z", "home_creating_z", "home_defending_z",
+        "away_attacking_z", "away_creating_z", "away_defending_z",
+        "attacking_z_diff", "creating_z_diff", "defending_z_diff",
     ))]
     for split in ["train", "val", "test", "predict"]:
         sub = df[df["split"] == split]
