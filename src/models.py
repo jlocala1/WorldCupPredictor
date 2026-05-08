@@ -10,12 +10,13 @@ from sklearn.preprocessing import StandardScaler
 MODELS_DIR = Path(__file__).resolve().parents[1] / 'models'
 FEATURES_PATH = Path(__file__).resolve().parents[1] / 'data' / 'processed' / 'features.csv'
 
-FEATURE_FILTERS = ['form_', 'elo', 'fifa_', 'squad_', 'caps']
+FEATURE_FILTERS = ['form_', 'elo', 'fifa_', 'squad_', 'caps', 'h2h_', '_z', '_z_diff']
 TARGET_NAMES = ['away_win', 'draw', 'home_win']
 
 
 def prepare_data(df):
     features = [c for c in df.columns if any(x in c for x in FEATURE_FILTERS)]
+    print(f"Selected {len(features)} features: {sorted(features)}\n")
 
     train_df = df[df['split'] == 'train'].dropna(subset=['label'])
     val_df = df[df['split'] == 'val'].dropna(subset=['label'])
