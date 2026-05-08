@@ -325,58 +325,115 @@ def _fotmob_player_scores() -> pd.DataFrame:
     return fm[["norm_name", "attacking_z", "creating_z", "defending_z"]].reset_index(drop=True)
 
 
-def _understat_player_scores() -> pd.DataFrame:
-    """Per-player attacking_z + creating_z (latest-season snapshot) from Understat.
+def _understat_player_scores_per_season() -> pd.DataFrame:
+    """Per-(player, season) attacking_z + creating_z from Understat.
 
-    Returns a DataFrame keyed by `norm_name` with columns attacking_z, creating_z.
+    Returns one row per (player, year) — does NOT collapse to a single
+    snapshot per player. This lets add_position_zscores look up each cohort
+    player's stats from the season corresponding to the match date, giving
+    date-correct z-scores for matches in 2014-2024 where Understat has data.
+
+    Per-90 stats are z-scored within (league, year) pool — so a player is
+    compared to others in the same league in the same season.
+
     Missing file -> empty frame.
     """
     path = DATA_RAW / "understat_player_stats.csv"
     if not path.exists():
-        return pd.DataFrame(columns=["norm_name", "attacking_z", "creating_z"])
+        return pd.DataFrame(columns=["norm_name", "year", "attacking_z", "creating_z"])
     us = pd.read_csv(path)
-
-    # Filter players with at least 450 minutes (~5 full games)
     us = us[us["time"].fillna(0) >= 450].copy()
     if us.empty:
-        return pd.DataFrame(columns=["norm_name", "attacking_z", "creating_z"])
+        return pd.DataFrame(columns=["norm_name", "year", "attacking_z", "creating_z"])
 
     nineties = us["time"] / 90.0
     for stat in ["goals", "xG", "npxG", "assists", "xA", "key_passes"]:
         us[f"{stat}_p90"] = us[stat] / nineties
 
-    # Z-score each per-90 within (league, year) pool
     grouped = us.groupby(["league", "year"], group_keys=False)
     for stat in ["goals", "xG", "npxG", "assists", "xA", "key_passes"]:
         us[f"{stat}_z"] = grouped[f"{stat}_p90"].transform(_z_score)
 
     us["attacking_z"] = us[["goals_z", "xG_z", "npxG_z"]].mean(axis=1)
     us["creating_z"] = us[["assists_z", "xA_z", "key_passes_z"]].mean(axis=1)
-
     us["norm_name"] = us["player_name"].map(_normalize_player_name)
 
-    # Latest-season snapshot per player (anachronistic for older matches but
-    # consistent with our caps treatment — documented limitation)
-    return (
-        us.sort_values("year", ascending=False)
-        .drop_duplicates("norm_name")[["norm_name", "attacking_z", "creating_z"]]
-        .reset_index(drop=True)
-    )
+    return us[["norm_name", "year", "attacking_z", "creating_z"]].dropna(
+        subset=["norm_name"]
+    ).reset_index(drop=True)
 
 
-def _fbref_defending_scores() -> pd.DataFrame:
-    """Per-player defending_z (latest-season snapshot) from the fbref `misc` table.
+def _transfermarkt_player_seasons() -> pd.DataFrame:
+    """Per-(player_id, season) attacking_z + creating_z from Transfermarkt scorerliste.
 
-    Uses TklW + Int (per 90, z-scored within league+season). No total Tkl or
-    Blocks because fbref's public HTML strips them; this is the best signal we
-    can extract without a paid data feed.
+    Tier 2 in the cascade — supplies date-correct *basic* stats (Goals, Assists)
+    for older Big 5 matches (pre-2014) and non-Big-5 leagues (MLS, Saudi Pro,
+    Liga MX, Brasileirão, Eredivisie, Liga Portugal, Belgian Pro) where
+    Understat doesn't reach. Joins to cohort by `player_id` directly — same
+    Transfermarkt ID system we already use elsewhere, so no name matching.
 
-    Returns DataFrame keyed by `norm_name` with column defending_z. Missing
-    file -> empty frame.
+    Returns one row per (player_id, season) — NOT collapsed to a snapshot.
+    Composite scores are based on Goals/Apps and Assists/Apps (per-90 proxy
+    since TM doesn't expose minutes on this page) z-scored within
+    (league_code, season).
+    """
+    path = DATA_RAW / "transfermarkt_player_seasons.csv"
+    if not path.exists():
+        return pd.DataFrame(columns=["player_id", "season", "attacking_z", "creating_z"])
+    tm = pd.read_csv(path)
+    tm = tm[tm["apps"].fillna(0) >= 5].copy()
+    if tm.empty:
+        return pd.DataFrame(columns=["player_id", "season", "attacking_z", "creating_z"])
+
+    # Per-appearance rates (proxy for per-90 — TM scorerliste doesn't expose minutes)
+    tm["goals_per_app"] = tm["goals"] / tm["apps"]
+    tm["assists_per_app"] = tm["assists"] / tm["apps"]
+
+    grouped = tm.groupby(["league_code", "season"], group_keys=False)
+    tm["attacking_z"] = grouped["goals_per_app"].transform(_z_score)
+    tm["creating_z"] = grouped["assists_per_app"].transform(_z_score)
+
+    return tm[["player_id", "season", "attacking_z", "creating_z"]].dropna(
+        subset=["player_id"]
+    ).reset_index(drop=True)
+
+
+def _football_season_year(match_date: pd.Timestamp) -> int | None:
+    """Map a calendar date to its football season's start year.
+
+    Football seasons run Aug-May; Understat's `year` is the start year. So:
+      - Aug-Dec match  → season starts that year   (e.g. 2017-10-15 → 2017)
+      - Jan-May match  → season started prior year (e.g. 2018-03-12 → 2017)
+      - Jun-Jul match  → off-season; treat as prior-year season
+
+    Returns None if input is NaT.
+    """
+    if pd.isna(match_date):
+        return None
+    return int(match_date.year if match_date.month >= 8 else match_date.year - 1)
+
+
+def _fbref_defending_scores_per_season() -> pd.DataFrame:
+    """Per-(player, season) defending_z from the fbref `misc` table.
+
+    Used as the defensive equivalent of `_understat_player_scores_per_season`:
+    keeps one row per (player × season) so add_position_zscores can do a
+    backward merge_asof and get date-correct defending_z for cohort players
+    based on the match's football-season year.
+
+    Coverage: Big 5 leagues only, 2017-2024 (the seasons soccerdata
+    successfully cached before fbref stripped advanced HTML). Pre-2017 and
+    non-Big-5 cohort players still get current-fotmob fallback or NaN.
+
+    fbref's `season` column is the season-end year format like "1718", "2425".
+    We map this to the football season's start year (e.g., 1718 → 2017) so
+    it lines up with the merge_asof semantics used for Understat.
+
+    Returns: norm_name, year, defending_z. Missing file -> empty frame.
     """
     path = DATA_RAW / "fbref_player_stats.csv"
     if not path.exists():
-        return pd.DataFrame(columns=["norm_name", "defending_z"])
+        return pd.DataFrame(columns=["norm_name", "year", "defending_z"])
     fb = pd.read_csv(path)
 
     def find(*needles):
@@ -389,11 +446,11 @@ def _fbref_defending_scores() -> pd.DataFrame:
     tklw_col = find("TklW")
     int_col = find("Int") or find("Performance_Int")
     if not (min_col and tklw_col and int_col):
-        return pd.DataFrame(columns=["norm_name", "defending_z"])
+        return pd.DataFrame(columns=["norm_name", "year", "defending_z"])
 
     fb = fb[fb[min_col].fillna(0) >= 450].copy()
     if fb.empty:
-        return pd.DataFrame(columns=["norm_name", "defending_z"])
+        return pd.DataFrame(columns=["norm_name", "year", "defending_z"])
 
     nineties = fb[min_col] / 90.0
     fb["TklW_p90"] = fb[tklw_col] / nineties
@@ -405,92 +462,203 @@ def _fbref_defending_scores() -> pd.DataFrame:
     fb["defending_z"] = fb[["TklW_z", "Int_z"]].mean(axis=1)
 
     fb["norm_name"] = fb["player"].map(_normalize_player_name)
-    return (
-        fb.sort_values("season", ascending=False)
-        .drop_duplicates("norm_name")[["norm_name", "defending_z"]]
-        .reset_index(drop=True)
-    )
+
+    # Map fbref's "1718"-style season string to the football season's start year (2017).
+    def _fbref_season_to_start_year(s):
+        try:
+            s = str(s).strip()
+            # Forms like "1718", "2425", "2017-2018", "2017-18"
+            digits = "".join(c for c in s if c.isdigit())
+            if len(digits) == 4:
+                # "1718" -> 2017
+                start = int("20" + digits[:2])
+                return start
+            if len(digits) == 8:
+                # "20172018" or "2017-2018"
+                return int(digits[:4])
+            return None
+        except Exception:
+            return None
+
+    fb["year"] = fb["season"].apply(_fbref_season_to_start_year)
+    fb = fb.dropna(subset=["norm_name", "year"])
+    fb["year"] = fb["year"].astype(int)
+    return fb[["norm_name", "year", "defending_z"]].reset_index(drop=True)
 
 
 def add_position_zscores(df: pd.DataFrame) -> pd.DataFrame:
     """Position-blind player skill z-scores aggregated to team level.
 
-    Composite scores per player (z-scored within their league-season):
-      attacking_z = mean(goals/90_z, xG/90_z, npxG/90_z)            [from Understat]
-      creating_z  = mean(assists/90_z, xA/90_z, key_passes/90_z)    [from Understat]
-      defending_z = mean(TklW/90_z, Int/90_z)                        [from fbref `misc` table]
+    Per-player score cascade (best stats from the time period):
+      Tier 1: Understat per-season match — for the cohort player's stats
+              from the season corresponding to the match date (closest-prior
+              fallback). Available 2014-2024 for Big 5 + RPL leagues.
+              Date-correct.
+      Tier 2: fotmob current-season snapshot — multi-league (12 leagues
+              including MLS / Saudi / Liga MX / Brasileirão / etc.) but
+              current 2025-26 only. Anachronistic for older matches.
+      Tier 3: fbref `misc` table for defensive stats only (TklW, Int).
+              Latest-season-per-player snapshot.
 
-    Then per (team, match_date), team scores = mean of TOP 8 cohort players per
-    skill (best contributors regardless of nominal position; an attacking
-    fullback's elite creating_z counts toward the team's creating_z even though
-    fbref classifies them as DF).
+    Composite scores per player:
+      attacking_z = mean(goals/90_z, xG/90_z, npxG/90_z) [Understat]
+                    OR mean(goals/90_z, xG/90_z, xGOT/90_z) [fotmob]
+      creating_z  = mean(assists/90_z, xA/90_z, KP/90_z) [Understat]
+                    OR mean(...big_chances, key_passes, dribbles) [fotmob]
+      defending_z = mean(Tkl/90_z, Int/90_z, Blk/90_z, Recov/90_z) [fotmob]
+                    OR mean(TklW/90_z, Int/90_z) [fbref misc fallback]
+
+    Per (team, match_date): score = mean of TOP 8 cohort players per skill.
 
     Adds 9 columns: home/away_{attacking,creating,defending}_z + 3 diffs.
 
     Limitations (documented in report):
-      - **No progressive passes / progressive carries** — fbref recently stripped
-        these from public HTML; Understat doesn't track them. We keep the marquee
-        modern attacking/creating metrics (xG, xA, npxG, KP) but not progression.
-      - **Latest-season snapshot per player.** A 2014 match uses each cohort
-        player's most-recent-Understat-season stats — anachronistic for older
-        matches but consistent with how we treat international caps.
-      - **Big 5 (+ RPL) only.** Players in MLS, Saudi, Liga MX, Brazilian Serie A,
-        J1, etc. don't have Understat coverage and contribute NaN. This will
-        underweight teams whose stars play outside Europe; the model can use
-        the squad-value features to compensate.
-      - If neither raw CSV exists yet, this function is a no-op (all NaN).
+      - **No progressive passes / progressive carries** — fbref recently
+        stripped these from public HTML; Understat doesn't track them.
+      - **Pre-2014 matches and non-Big-5 players use the fotmob current
+        snapshot** — anachronistic, but bounded: for predict (2026 WC) the
+        snapshot IS the right time period.
+      - **No covered league at all** for some smaller national teams →
+        contributes NaN, model handles via imputation.
     """
     out_cols = ["home_attacking_z", "home_creating_z", "home_defending_z",
                 "away_attacking_z", "away_creating_z", "away_defending_z",
                 "attacking_z_diff", "creating_z_diff", "defending_z_diff"]
 
-    # Combine sources: fotmob first (12 leagues, full stats incl. defensive),
-    # fall back to Understat for retired/older players who may only appear in
-    # Understat's historical 2014-2024 Big 5 data, and fbref misc for defending
-    # values when neither covers a player.
-    fm = _fotmob_player_scores().rename(columns={
-        "attacking_z": "att_fm", "creating_z": "cre_fm", "defending_z": "def_fm"
-    })
-    us = _understat_player_scores().rename(columns={
-        "attacking_z": "att_us", "creating_z": "cre_us"
-    })
-    fb = _fbref_defending_scores().rename(columns={"defending_z": "def_fb"})
+    us_per_season = _understat_player_scores_per_season()
+    tm_per_season = _transfermarkt_player_seasons()
+    fm_current = _fotmob_player_scores()
+    fb_per_season = _fbref_defending_scores_per_season()
 
-    if fm.empty and us.empty and fb.empty:
+    if (us_per_season.empty and tm_per_season.empty
+            and fm_current.empty and fb_per_season.empty):
         for c in out_cols:
             df[c] = np.nan
         return df
 
-    bases = [d for d in [fm, us, fb] if not d.empty]
-    player_scores = bases[0]
-    for other in bases[1:]:
-        player_scores = player_scores.merge(other, on="norm_name", how="outer")
-
-    player_scores["attacking_z"] = (
-        player_scores.get("att_fm", pd.Series(np.nan)).combine_first(
-            player_scores.get("att_us", pd.Series(np.nan)))
-    )
-    player_scores["creating_z"] = (
-        player_scores.get("cre_fm", pd.Series(np.nan)).combine_first(
-            player_scores.get("cre_us", pd.Series(np.nan)))
-    )
-    player_scores["defending_z"] = (
-        player_scores.get("def_fm", pd.Series(np.nan)).combine_first(
-            player_scores.get("def_fb", pd.Series(np.nan)))
-    )
-    player_scores = player_scores[["norm_name", "attacking_z", "creating_z", "defending_z"]]
-
-    # Bridge tournament_squads (Transfermarkt player_ids + names) -> player scores
+    # Build cohort with player names + each match's season year
+    cohort = _build_tournament_cohort(df)
     ts = pd.read_csv(DATA_RAW / "tournament_squads.csv", parse_dates=["tournament_date"])
     ts["norm_name"] = ts["player_name"].map(_normalize_player_name)
-    bridge = (
-        ts[["player_id", "norm_name"]]
-        .drop_duplicates("player_id")
-        .merge(player_scores, on="norm_name", how="left")
-        .drop(columns="norm_name")
-    )
+    name_lookup = ts[["player_id", "norm_name"]].drop_duplicates("player_id")
+    cohort = cohort.merge(name_lookup, on="player_id", how="left")
+    cohort["season_year"] = cohort["match_date"].apply(_football_season_year).astype("Int64")
 
-    cohort = _build_tournament_cohort(df).merge(bridge, on="player_id", how="left")
+    # === Tier 1: Understat per-season backward-merge ===
+    # For each (player, match_season), look up Understat stats from that season
+    # or the closest prior season the player played.
+    if not us_per_season.empty:
+        us_sorted = us_per_season.sort_values("year").reset_index(drop=True)
+        cohort_sorted = cohort.sort_values("season_year").reset_index(drop=True)
+        # merge_asof requires non-NaN sort key; drop rows missing season_year and re-merge later
+        valid_mask = cohort_sorted["season_year"].notna() & cohort_sorted["norm_name"].notna()
+        valid = cohort_sorted[valid_mask].copy()
+        valid["season_year"] = valid["season_year"].astype(int)
+        valid = pd.merge_asof(
+            valid,
+            us_sorted,
+            left_on="season_year", right_on="year",
+            by="norm_name",
+            direction="backward",
+        ).drop(columns=["year"], errors="ignore")
+        valid = valid.rename(columns={
+            "attacking_z": "att_us", "creating_z": "cre_us"
+        })
+        # Stitch back: rows that didn't have a valid sort key get NaN att_us/cre_us
+        cohort = cohort.merge(
+            valid[["team", "match_date", "player_id", "att_us", "cre_us"]],
+            on=["team", "match_date", "player_id"], how="left"
+        )
+    else:
+        cohort["att_us"] = np.nan
+        cohort["cre_us"] = np.nan
+
+    # === Tier 2: Transfermarkt per-season backward-merge by player_id ===
+    # Date-correct basic stats (Gls/Ast) for older Big 5 + all non-Big-5 leagues.
+    # Joins by player_id (same TM IDs as tournament_squads), no name matching.
+    if not tm_per_season.empty:
+        tm_sorted = tm_per_season.sort_values("season").reset_index(drop=True)
+        cohort_sorted_pid = cohort.sort_values("season_year").reset_index(drop=True)
+        valid_mask_tm = (
+            cohort_sorted_pid["season_year"].notna()
+            & cohort_sorted_pid["player_id"].notna()
+        )
+        valid_tm = cohort_sorted_pid[valid_mask_tm].copy()
+        valid_tm["season_year"] = valid_tm["season_year"].astype(int)
+        valid_tm = pd.merge_asof(
+            valid_tm, tm_sorted,
+            left_on="season_year", right_on="season",
+            by="player_id",
+            direction="backward",
+        ).drop(columns=["season"], errors="ignore")
+        valid_tm = valid_tm.rename(columns={
+            "attacking_z": "att_tm", "creating_z": "cre_tm"
+        })
+        cohort = cohort.merge(
+            valid_tm[["team", "match_date", "player_id", "att_tm", "cre_tm"]],
+            on=["team", "match_date", "player_id"], how="left"
+        )
+    else:
+        cohort["att_tm"] = np.nan
+        cohort["cre_tm"] = np.nan
+
+    # === Tier 3: fotmob current snapshot fallback ===
+    if not fm_current.empty:
+        cohort = cohort.merge(
+            fm_current.rename(columns={
+                "attacking_z": "att_fm",
+                "creating_z": "cre_fm",
+                "defending_z": "def_fm",
+            }),
+            on="norm_name", how="left",
+        )
+    else:
+        cohort["att_fm"] = np.nan
+        cohort["cre_fm"] = np.nan
+        cohort["def_fm"] = np.nan
+
+    # === Tier 4: fbref per-season defending (Big 5 2017-2024) ===
+    # Date-correct defending_z for Big 5 cohort players in the relevant seasons.
+    # Same merge_asof pattern as Understat (by norm_name, on year, backward).
+    if not fb_per_season.empty:
+        fb_sorted = fb_per_season.sort_values("year").reset_index(drop=True)
+        cohort_sorted_fb = cohort.sort_values("season_year").reset_index(drop=True)
+        valid_mask_fb = (
+            cohort_sorted_fb["season_year"].notna()
+            & cohort_sorted_fb["norm_name"].notna()
+        )
+        valid_fb = cohort_sorted_fb[valid_mask_fb].copy()
+        valid_fb["season_year"] = valid_fb["season_year"].astype(int)
+        valid_fb = pd.merge_asof(
+            valid_fb, fb_sorted,
+            left_on="season_year", right_on="year",
+            by="norm_name",
+            direction="backward",
+        ).drop(columns=["year"], errors="ignore")
+        valid_fb = valid_fb.rename(columns={"defending_z": "def_fb"})
+        cohort = cohort.merge(
+            valid_fb[["team", "match_date", "player_id", "def_fb"]],
+            on=["team", "match_date", "player_id"], how="left"
+        )
+    else:
+        cohort["def_fb"] = np.nan
+
+    # Resolve cascade. Priority order for attacking/creating:
+    #   Tier 1 Understat-per-season (xG/xA, advanced) →
+    #   Tier 2 Transfermarkt-per-season (basic Gls/Ast, date-correct) →
+    #   Tier 3 fotmob current (advanced but anachronistic).
+    # Defending: fotmob current → fbref misc fallback.
+    cohort["attacking_z"] = (
+        cohort["att_us"]
+        .combine_first(cohort["att_tm"])
+        .combine_first(cohort["att_fm"])
+    )
+    cohort["creating_z"] = (
+        cohort["cre_us"]
+        .combine_first(cohort["cre_tm"])
+        .combine_first(cohort["cre_fm"])
+    )
+    cohort["defending_z"] = cohort["def_fm"].combine_first(cohort["def_fb"])
 
     def top_n_mean(series: pd.Series, n: int = 8) -> float:
         clean = series.dropna()
