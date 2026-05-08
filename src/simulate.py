@@ -75,15 +75,44 @@ DIFF_FEATURES: dict[str, tuple[str, str]] = {
     "defending_z_diff": ("home_defending_z", "away_defending_z"),
 }
 
-# Standard seeded 32-team single-elim bracket. Reading top-to-bottom, adjacent
-# pairs are R32 matches and the structure ensures seed 1 only meets seed 2 in
-# the final, seeds 1-4 are in different quarters, etc.
-BRACKET_ORDER_32 = [
-     1, 32, 16, 17,  9, 24,  8, 25,
-     5, 28, 12, 21, 13, 20,  4, 29,
-     3, 30, 14, 19, 11, 22,  6, 27,
-     7, 26, 10, 23, 15, 18,  2, 31,
-]
+# Official FIFA 2026 World Cup knockout structure.
+# Each R32 match has two slot specs of the form "1A"/"2B" (group winner /
+# runner-up) or "3rd:{A,B,C}" (best third from those groups; resolved at
+# bracket-build time via bipartite matching against the 8 advancing thirds).
+# Match numbers (73-88) match FIFA's official numbering; later rounds reference
+# them directly so the bracket flow matches what FIFA published.
+R32_MATCHUPS: dict[int, tuple[str, str]] = {
+    73: ("2A", "2B"),
+    74: ("1E", "3rd:ABCDF"),
+    75: ("1F", "2C"),
+    76: ("1C", "2F"),
+    77: ("1I", "3rd:CDFGH"),
+    78: ("2E", "2I"),
+    79: ("1A", "3rd:CEFHI"),
+    80: ("1L", "3rd:EHIJK"),
+    81: ("1D", "3rd:BEFIJ"),
+    82: ("1G", "3rd:AEHIJ"),
+    83: ("2K", "2L"),
+    84: ("1H", "2J"),
+    85: ("1B", "3rd:EFGIJ"),
+    86: ("1J", "2H"),
+    87: ("1K", "3rd:DEIJL"),
+    88: ("2D", "2G"),
+}
+
+# R16, QF, SF, Final pairings - which earlier-round match winners feed each
+# later match. Verified against FIFA's published 2026 knockout flow.
+R16_PAIRINGS: dict[int, tuple[int, int]] = {
+    89: (74, 77), 90: (73, 75), 91: (76, 78), 92: (79, 80),
+    93: (83, 84), 94: (81, 82), 95: (86, 88), 96: (85, 87),
+}
+QF_PAIRINGS: dict[int, tuple[int, int]] = {
+    97: (89, 90), 98: (93, 94), 99: (91, 92), 100: (95, 96),
+}
+SF_PAIRINGS: dict[int, tuple[int, int]] = {
+    101: (97, 98), 102: (99, 100),
+}
+FINAL_PAIRING: dict[int, tuple[int, int]] = {104: (101, 102)}
 
 # FIFA 3-letter codes -> our canonical team names. Used to map the `Nation`
 # column in players_data-2025_2026.csv (format "fr FRA") to the team-name
@@ -561,19 +590,92 @@ def select_qualifiers(all_standings: list[list[dict]]) -> list[dict]:
 # -----------------------------------------------------------------------------
 # Knockout bracket
 # -----------------------------------------------------------------------------
-def seed_bracket(qualifiers: list[dict]) -> list[str]:
-    """Arrange the 32 qualifying teams into standard seeded bracket order.
+def assign_thirds_to_slots(advancing_thirds: list[dict]) -> dict[int, dict]:
+    """Bipartite matching: assign 8 advancing 3rd-place teams to the 8 R32
+    slots that need a third, respecting each slot's group-letter eligibility.
 
-    `qualifiers[0]` is the strongest seed (top group winner), `qualifiers[31]`
-    is the weakest (last 3rd-place qualifier). Returns a 32-team list where
-    adjacent pairs are R32 matchups and the bracket is balanced - top seeds
-    only meet in late rounds if they all keep winning.
+    FIFA's official lookup table (Annex C of the tournament regulations) has a
+    specific assignment for each of 495 possible (8-of-12-groups) combinations.
+    Without that exact table, we solve the same constraint-satisfaction problem
+    via backtracking: every assignment we produce satisfies FIFA's eligibility
+    rules, even if the specific tie-breaks may differ from FIFA's published
+    table when multiple matchings are valid.
+
+    Returns dict {match_id -> third_team_record}.
+    Raises RuntimeError if no valid assignment exists for this combination.
     """
-    return [qualifiers[s - 1]["team"] for s in BRACKET_ORDER_32]
+    third_slots = {mid: spec.split(":")[1] for mid, (s1, s2) in R32_MATCHUPS.items()
+                   for spec in (s1, s2) if spec.startswith("3rd:")}
+    slot_ids = sorted(third_slots.keys())
+    n = len(slot_ids)
+    assert n == len(advancing_thirds) == 8
+
+    # Order thirds by performance (best first) so when multiple matchings are
+    # valid, the strongest third gets a slot first - a deterministic tie-break.
+    sorted_thirds = sorted(advancing_thirds,
+                           key=lambda t: (-t["pts"], -t["gd"], -t["gf"], t["ga"]))
+    used = [False] * n
+    result: dict[int, dict] = {}
+
+    def backtrack(slot_idx: int) -> bool:
+        if slot_idx == n:
+            return True
+        slot_id = slot_ids[slot_idx]
+        eligible = third_slots[slot_id]
+        for j, t in enumerate(sorted_thirds):
+            if used[j]:
+                continue
+            if t["group"] in eligible:
+                used[j] = True
+                result[slot_id] = t
+                if backtrack(slot_idx + 1):
+                    return True
+                used[j] = False
+                del result[slot_id]
+        return False
+
+    if not backtrack(0):
+        raise RuntimeError(
+            f"No valid third-place assignment for advancing groups "
+            f"{sorted(t['group'] for t in advancing_thirds)}")
+    return result
+
+
+def build_r32_bracket(all_standings: list[list[dict]]) -> dict[int, tuple[dict, dict]]:
+    """Build the 16 Round-of-32 matchups using the official FIFA 2026 structure.
+
+    Returns dict {match_id -> (home_record, away_record)}.
+    """
+    # Index by group letter for O(1) lookup
+    by_group: dict[str, list[dict]] = {}
+    for group_table in all_standings:
+        if not group_table:
+            continue
+        by_group[group_table[0]["group"]] = group_table
+
+    # Pick the 8 best 3rd-place teams (top 8 of 12 by the FIFA tiebreaker chain).
+    all_thirds = [g[2] for g in all_standings]
+    sorted_thirds = sorted(all_thirds,
+                           key=lambda t: (-t["pts"], -t["gd"], -t["gf"], t["ga"]))
+    advancing_thirds = sorted_thirds[:8]
+    third_assignment = assign_thirds_to_slots(advancing_thirds)
+
+    def resolve(spec: str, match_id: int) -> dict:
+        if spec.startswith("1") or spec.startswith("2"):
+            position = 0 if spec.startswith("1") else 1
+            group_letter = spec[1]
+            return by_group[group_letter][position]
+        # Else "3rd:..." - look up the team assigned to this slot
+        return third_assignment[match_id]
+
+    bracket: dict[int, tuple[dict, dict]] = {}
+    for match_id, (slot1, slot2) in R32_MATCHUPS.items():
+        bracket[match_id] = (resolve(slot1, match_id), resolve(slot2, match_id))
+    return bracket
 
 
 def simulate_knockout(
-    bracket_teams: list[str],
+    r32_bracket: dict[int, tuple[dict, dict]],
     snapshots: dict,
     predict_row_cache: dict,
     h2h_cache: dict,
@@ -586,36 +688,50 @@ def simulate_knockout(
     verbose: bool = False,
     shootout_stats: dict | None = None,
 ) -> tuple[str, dict]:
-    """Run a 32-team single-elim from R32 to final.
+    """Run the FIFA 2026 knockout bracket from R32 through the final.
 
-    Returns (champion, deepest_round_per_team) where deepest_round_per_team
-    maps team -> "R32" / "R16" / "QF" / "SF" / "Final" / "Champion".
+    `r32_bracket` is a dict {match_id -> (home_record, away_record)} for the
+    16 R32 matches; later rounds resolve via the R16/QF/SF/FINAL pairing tables.
+
+    Returns (champion_name, deepest_round_per_team) where deepest_round maps
+    team -> "R32" / "R16" / "QF" / "SF" / "Final" / "Champion".
     """
-    deepest: dict[str, str] = {t: "R32" for t in bracket_teams}
-    round_names = ["R16", "QF", "SF", "Final", "Champion"]
-    current = list(bracket_teams)
-    round_idx = 0
+    deepest: dict[str, str] = {}
+    for h, a in r32_bracket.values():
+        deepest[h["team"]] = "R32"
+        deepest[a["team"]] = "R32"
 
-    while len(current) > 1:
-        next_round: list[str] = []
-        for i in range(0, len(current), 2):
-            home, away = current[i], current[i + 1]
-            outcome, _, _ = run_match_sim(
-                home, away, snapshots, predict_row_cache, h2h_cache, model, elo_tracker,
-                fill_values, feature_cols, classes, scaler=scaler,
-                neutral=True, knockout=True, shootout_stats=shootout_stats,
-            )
-            winner = home if outcome == 2 else away
-            next_round.append(winner)
-            if verbose:
-                print(f"    {home:>30} vs {away:<30} -> {winner}")
-        # Mark how far each *advancing* team has now reached
-        for t in next_round:
-            deepest[t] = round_names[round_idx]
-        current = next_round
-        round_idx += 1
+    def play(match_id: int, home: dict, away: dict) -> dict:
+        """Run one match and return the winning team's record."""
+        outcome, _, _ = run_match_sim(
+            home["team"], away["team"], snapshots, predict_row_cache, h2h_cache,
+            model, elo_tracker, fill_values, feature_cols, classes, scaler=scaler,
+            neutral=True, knockout=True, shootout_stats=shootout_stats,
+        )
+        winner = home if outcome == 2 else away
+        if verbose:
+            print(f"    M{match_id:>3}  {home['team']:>26} vs {away['team']:<26} -> {winner['team']}")
+        return winner
 
-    return current[0], deepest
+    # Round of 32: play all 16 matches; mark winners as having reached R16.
+    winners: dict[int, dict] = {}
+    for match_id, (home, away) in r32_bracket.items():
+        winner = play(match_id, home, away)
+        winners[match_id] = winner
+        deepest[winner["team"]] = "R16"
+
+    # Subsequent rounds use the predefined pairing tables.
+    for round_name, pairings in [("QF", R16_PAIRINGS), ("SF", QF_PAIRINGS),
+                                  ("Final", SF_PAIRINGS), ("Champion", FINAL_PAIRING)]:
+        for match_id, (mid1, mid2) in pairings.items():
+            winner = play(match_id, winners[mid1], winners[mid2])
+            winners[match_id] = winner
+            deepest[winner["team"]] = round_name
+
+    # The final's winner is the only winners entry from FINAL_PAIRING.
+    final_match_id = next(iter(FINAL_PAIRING.keys()))
+    champion = winners[final_match_id]["team"]
+    return champion, deepest
 
 
 # -----------------------------------------------------------------------------
@@ -659,10 +775,9 @@ def simulate_tournament(
             print(f"  Group {letter}: " + ", ".join(
                 f"{e['team']}({e['pts']}pts,{e['gd']:+d}gd)" for e in group_table))
 
-    qualifiers = select_qualifiers(all_standings)
-    bracket = seed_bracket(qualifiers)
+    r32_bracket = build_r32_bracket(all_standings)
     champion, deepest = simulate_knockout(
-        bracket, snapshots, predict_row_cache, h2h_cache, model, elo_tracker,
+        r32_bracket, snapshots, predict_row_cache, h2h_cache, model, elo_tracker,
         fill_values, feature_cols, classes, scaler=scaler, verbose=verbose,
         shootout_stats=shootout_stats,
     )
