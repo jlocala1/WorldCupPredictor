@@ -62,15 +62,18 @@ LEAGUES = [
 # fotmob's internal stat names → our column names. Mix of totals and per-90
 # (we'll compute consistent per-90 in features.py from MinutesPlayed).
 STATS = {
-    "goals":               "goals_total",
-    "goal_assist":         "assists_total",
-    "expected_goals":      "xG_total",
-    "expected_assists":    "xA_total",
-    "big_chance_created":  "big_chance_total",
-    "total_tackle":        "tackles_per90",     # already per 90
-    "interception":        "int_per90",         # already per 90
-    "outfielder_block":    "blocks_per90",      # already per 90
-    "ball_recovery":       "recoveries_per90",  # already per 90
+    "goals":                  "goals_total",
+    "goal_assist":            "assists_total",
+    "expected_goals":         "xG_total",
+    "expected_assists":       "xA_total",
+    "expected_goalsontarget": "xGOT_total",       # xG of shots on target — finishing-quality signal
+    "big_chance_created":     "big_chance_total",
+    "total_att_assist":       "key_passes_total", # passes leading to a shot (chances created)
+    "won_contest":            "dribbles_per90",   # successful take-ons, already per 90
+    "total_tackle":           "tackles_per90",    # already per 90
+    "interception":           "int_per90",        # already per 90
+    "outfielder_block":       "blocks_per90",     # already per 90
+    "ball_recovery":          "recoveries_per90", # already per 90
 }
 
 

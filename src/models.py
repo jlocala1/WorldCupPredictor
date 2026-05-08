@@ -10,7 +10,12 @@ from sklearn.preprocessing import StandardScaler
 MODELS_DIR = Path(__file__).resolve().parents[1] / 'models'
 FEATURES_PATH = Path(__file__).resolve().parents[1] / 'data' / 'processed' / 'features.csv'
 
+<<<<<<< HEAD
 FEATURE_FILTERS = ['form_', 'elo', 'fifa_', 'squad_', 'caps', 'h2h_', '_z', '_z_diff']
+=======
+FEATURE_FILTERS = ['form_', 'h2h_', 'elo', 'fifa_', 'squad_', 'top26_',
+                   'avg_value', 'caps', '_z', 'neutral']
+>>>>>>> 1720998b93064493c7ff7b3e3029bbeee500991a
 TARGET_NAMES = ['away_win', 'draw', 'home_win']
 
 

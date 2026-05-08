@@ -292,13 +292,16 @@ def _fotmob_player_scores() -> pd.DataFrame:
     nineties = fm["minutes"] / 90.0
     for src, dst in [("goals_total", "goals_p90"), ("assists_total", "assists_p90"),
                      ("xG_total", "xG_p90"), ("xA_total", "xA_p90"),
-                     ("big_chance_total", "big_chance_p90")]:
+                     ("xGOT_total", "xGOT_p90"),
+                     ("big_chance_total", "big_chance_p90"),
+                     ("key_passes_total", "key_passes_p90")]:
         if src in fm.columns:
             fm[dst] = fm[src] / nineties
 
     # Z-score every per-90 stat within (league) — current season, so no season grouping
     grouped = fm.groupby("league", group_keys=False)
-    for stat in ["goals_p90", "assists_p90", "xG_p90", "xA_p90", "big_chance_p90",
+    for stat in ["goals_p90", "assists_p90", "xG_p90", "xA_p90", "xGOT_p90",
+                 "big_chance_p90", "key_passes_p90", "dribbles_per90",
                  "tackles_per90", "int_per90", "blocks_per90", "recoveries_per90"]:
         if stat in fm.columns:
             fm[f"{stat}_z"] = grouped[stat].transform(_z_score)
@@ -309,9 +312,11 @@ def _fotmob_player_scores() -> pd.DataFrame:
             return pd.Series(np.nan, index=fm.index)
         return pd.concat(present, axis=1).mean(axis=1)
 
-    fm["attacking_z"] = avg_z("goals_p90_z", "xG_p90_z")
-    fm["creating_z"] = avg_z("assists_p90_z", "xA_p90_z", "big_chance_p90_z")
-    fm["defending_z"] = avg_z("tackles_per90_z", "int_per90_z", "blocks_per90_z", "recoveries_per90_z")
+    fm["attacking_z"] = avg_z("goals_p90_z", "xG_p90_z", "xGOT_p90_z")
+    fm["creating_z"] = avg_z("assists_p90_z", "xA_p90_z", "big_chance_p90_z",
+                             "key_passes_p90_z", "dribbles_per90_z")
+    fm["defending_z"] = avg_z("tackles_per90_z", "int_per90_z",
+                              "blocks_per90_z", "recoveries_per90_z")
 
     fm["norm_name"] = fm["player_name"].map(_normalize_player_name)
     # If a player appears in multiple leagues (loanee mid-season etc.), keep the
