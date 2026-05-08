@@ -10,3 +10,4 @@ __pycache__/
 CLAUDE.md
 .claude/
 .DS_Storedownloaded_files/
+models/
