@@ -7,7 +7,5 @@ __pycache__/
 *.csv
 *.xlsx
 *.zip
-CLAUDE.md
-.claude/
 .DS_Storedownloaded_files/
 models/

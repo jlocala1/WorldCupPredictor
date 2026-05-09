@@ -1,86 +1,153 @@
 # WorldCupPredictor
 
-CS475/675 Machine Learning final project — predicting 2026 FIFA World Cup
-match outcomes and simulating the full bracket.
+CS475/675 final project. Predicts 2026 FIFA World Cup match outcomes from
+historical data, then Monte Carlo simulates the full tournament — group stage
+plus 32-team knockout — sampling each match from the trained model's
+calibrated probabilities.
 
-## Setup
+## Quick start
 
-1. **Clone the repo.**
-2. **Install dependencies:**
-   ```
-   pip install -r requirements.txt
-   ```
-3. **Get the raw data.** Download the snapshot zip from the Drive link in
-   [DATA.md](DATA.md) and unzip into the project root so the structure is
-   `data/raw/<files>.csv`. Alternatively, pull each dataset from its source
-   per [DATA.md](DATA.md).
-4. **Generate the feature matrix:**
-   ```
-   python src/features.py
-   ```
-   Writes `data/processed/features.csv` (15,704 rows × 36 columns; ~30 sec).
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
 
-## What's in `features.csv`
+# 2. Get the raw data (see DATA.md for the Drive snapshot link or per-source links)
+#    Unzip into project root so the structure is data/raw/<files>.csv
 
-One row per match for every international football game from 2010 onward,
-plus the 72 published 2026 World Cup fixtures. Per match:
+# 3. Build the feature matrix (~30 sec)
+python src/features.py
 
-| Feature group | Columns |
+# 4. Train, tune, calibrate the models + run the ablation (~5-10 min)
+python src/models.py
+
+# 5. Monte Carlo simulate the 2026 World Cup (~14 min for n=100, ~140 min for n=1000)
+python src/simulate.py --iters 1000 --seed 42 --output models/sim_summary.csv
+```
+
+## What the code does
+
+### Match-outcome model (`src/features.py` + `src/models.py`)
+Predicts win/draw/loss for any international football match. Three calibrated
+models (multinomial logistic regression, random forest, XGBoost) trained on
+2010-2021 matches, tuned on 2022-2024, evaluated on held-out 2025–2026-Q1.
+A soft-voting ensemble averages the three. Test log loss is 0.827, which is
+roughly the same band as bookmaker implied probabilities (~0.95) and the
+published FiveThirtyEight WC '22 model (~1.00) — i.e. comparable to commercial
+baselines using only public data.
+
+Features per match (62 columns total = 31 base + 31 missingness flags):
+
+| Group | Columns |
 |---|---|
-| Identifiers | `date`, `home_team`, `away_team`, `tournament`, `neutral` |
-| Label & split | `label` (0 away win / 1 draw / 2 home win, NaN if unplayed), `split` (`train`/`val`/`test`/`predict`) |
 | Trailing form (last 10) | `home/away_form_{win_rate, gf, ga}` |
 | Head-to-head | `home_h2h_win_rate` |
-| Elo (full eloratings.net) | `home_elo`, `away_elo`, `elo_diff` |
+| Elo (eloratings.net formula) | `home_elo`, `away_elo`, `elo_diff` |
 | FIFA rank | `home/away_fifa_rank`, `fifa_rank_diff` |
-| Squad market value (date-correct) | `home/away_squad_value`, `top26_value`, `avg_value`, `squad_size`, plus `*_diff` |
-| International caps | `home/away_avg_caps` |
+| Squad market value (date-correct cohorts) | `home/away_{squad_value, top26_value, avg_value, squad_size}`, `*_diff` |
+| Position z-scores (4-tier source cascade) | `home/away_{attacking, creating, defending}_z`, `*_diff` |
+| Venue | `neutral` |
 
-Splits are chronological:
-- `train`: 2010 → 2021-12 (11,218 matches)
-- `val`: 2022 → 2024-12 (3,252)
-- `test`: 2025 → 2026-03 (1,162)
-- `predict`: the 72 unplayed 2026 WC fixtures (June 2026)
+The four-tier z-score cascade combines Understat (xG/xA, Big-5+RPL 2014-2024),
+Transfermarkt scorer-list (Goals/Assists, 12 leagues 2008-2024), fotmob
+(current 12-league snapshot), and fbref (defensive misc, Big-5 2017-2024). For
+each cohort player at each match date, it picks the highest-tier source with
+data for that (player, time period). See `notebooks/main.ipynb` for the writeup.
+
+### Tournament simulation (`src/simulate.py`)
+Monte Carlo over the 2026 WC. Each simulated match samples its outcome from
+the model's calibrated probabilities, and the Elo tracker updates after every
+match so a team's path through the bracket affects their later-round odds.
+Bracket structure matches what FIFA actually published for 2026:
+
+- Group stage is 12 groups of 4 with 6 matches each, ranked by points →
+  goal difference → goals for → goals against. Top 2 + 8 best third-place
+  teams advance.
+- Knockout uses FIFA's predetermined slot specs from the published bracket
+  (e.g. M73 = 2A vs 2B, M74 = 1E vs the third from groups A/B/C/D/F).
+  The eight third-place teams are slotted via bipartite matching against
+  FIFA's eligibility lists, which are designed so two teams from the same
+  group can't meet again in R32. R16/QF/SF/Final follow FIFA's published
+  pairing tree.
+- Knockout draws resolve via a penalty-shootout model: per-team conversion
+  rate (top 5 takers by attempts, from fbref) and GK save rate (with
+  empirical-Bayes shrinkage so a 0/5 keeper doesn't read as 0%). Teams whose
+  squads play mostly outside Big-5 leagues fall back to a dampened Elo prior.
+
+```bash
+# Headline run with the ensemble model + shootouts (recommended)
+python src/simulate.py --iters 1000 --seed 42
+
+# Compare across the three individual models for the report's "model agreement" table
+for m in lr rf xgb ensemble; do
+  python src/simulate.py --model $m --iters 100 --seed 42 \
+      --output models/sim_${m}_100.csv
+done
+
+# A/B test the shootout model
+python src/simulate.py --iters 1000 --seed 42 --no-shootouts \
+    --output models/sim_no_shootouts.csv
+```
+
+## Train / val / test / predict splits
+
+Splits are chronological, not random — a random split would leak future state
+into training, since the whole point is forecasting future matches.
+
+| Split | Years | Rows | Label coverage |
+|---|---|---|---|
+| train | 2010 → 2021-12 | 11,218 | 100% |
+| val | 2022 → 2024-12 | 3,252 | 100% |
+| test | 2025 → 2026-03 | 1,162 | 100% |
+| predict | 2026 WC fixtures | 72 | 0% (unplayed) |
 
 ## Project structure
 
 ```
 WorldCupPredictor/
 ├── src/
-│   ├── team_names.py          # canonical team-name mapping across data sources
-│   ├── elo.py                 # Elo rating module (eloratings.net methodology)
-│   ├── scrape_tournaments.py  # Transfermarkt tournament-squad scraper
-│   ├── features.py            # feature engineering pipeline → features.csv
-│   ├── models.py              # (planned) model training & evaluation
-│   └── simulate.py            # (planned) bracket simulation
+│   ├── team_names.py                  # canonical team-name normalization
+│   ├── elo.py                         # eloratings.net Elo formula
+│   ├── features.py                    # feature engineering → features.csv
+│   ├── models.py                      # train + tune + calibrate + ensemble + ablate
+│   ├── ensemble.py                    # SoftVoteEnsemble class (loaded from ensemble.pkl)
+│   ├── simulate.py                    # Monte Carlo tournament simulation
+│   ├── scrape_tournaments.py          # Transfermarkt tournament squads (44 editions)
+│   ├── scrape_understat.py            # Understat per-season Big-5 + RPL
+│   ├── scrape_fotmob.py               # fotmob current snapshot (12 leagues)
+│   ├── scrape_fbref.py                # fbref defensive misc table
+│   └── scrape_transfermarkt_seasons.py # TM scorerlist (12 leagues × 17 seasons)
 ├── data/
-│   ├── raw/                   # all source CSVs (gitignored, see DATA.md)
+│   ├── raw/                           # all source CSVs (gitignored, see DATA.md)
 │   └── processed/
-│       └── features.csv       # generated by features.py
+│       └── features.csv               # generated by features.py
+├── models/                            # gitignored — pickled artifacts + JSON summaries
+│   ├── lr.pkl, rf.pkl, xgb.pkl        # calibrated per-model predictors
+│   ├── ensemble.pkl                   # soft-voting ensemble (picklable class)
+│   ├── scaler.pkl, fill_values.pkl, feature_names.pkl, classes.pkl
+│   ├── best_params.json, summary.json, ablation.json, tuning_log.json
+│   └── sim_summary*.csv               # per-team Monte Carlo outputs
 ├── notebooks/
-│   └── main.ipynb             # final report writeup
-├── DATA.md                    # data source documentation
+│   └── main.ipynb                     # final report writeup
+├── DATA.md                            # data source documentation
 ├── README.md
 └── requirements.txt
 ```
 
-## Status
+## Known limitations
 
-- ✅ Data sources (martj42, cashncarry, Fjelstul, davidcariboo, Transfermarkt scrape)
-- ✅ Team-name normalization across sources
-- ✅ Feature engineering pipeline (36 columns, 100% coverage on 2026 WC predict split)
-- 🔧 Position z-scores from fbref advanced stats (xG, xA, progressive passes)
-- ⏳ Modeling: logistic regression baseline → random forest → XGBoost (with ablation)
-- ⏳ Group stage + knockout bracket simulation (with live Elo updates and shootout tiebreakers)
-- ⏳ Notebook writeup
+- FIFA rankings end 2024-06-20. Anything after that uses the latest snapshot.
+- Z-score coverage is ~32% on training (2010-2021) vs ~96% on the 2026 predict
+  split, because Understat and fbref's Big-5 advanced stats only go back to
+  2014/2017. We add missingness flags so the model can tell imputed values
+  from real ones, but the distribution shift is real.
+- Penalty conversion rates and GK save rates come from Big-5 only. Teams whose
+  squads mostly play outside the Big 5 fall back to a dampened-Elo shootout.
+- We don't separately simulate extra time before the shootout — a knockout
+  match that draws goes straight to penalties in our sim.
+- For the third-place team-to-slot assignment, when more than one valid
+  matching exists, FIFA's published Annex C picks a specific one; we use a
+  best-performing-third-first tie-break. The eligibility constraints are
+  always respected, so structurally our bracket is identical to one the real
+  tournament could produce.
 
-## Known limitations (footnoted in the report)
-
-- FIFA rankings end 2024-06-20; matches after that use the latest snapshot.
-- `international_caps` is a current snapshot from Transfermarkt — for older
-  matches the cap totals are anachronistic.
-- Squad-value cohorts are date-correct (per-match tournament-squad based) for
-  ~38-44% of training matches; smaller national teams that never played in a
-  major continental tournament have NaN squad-value features. Handled with
-  median imputation + missingness indicator in `models.py`.
-
+See the notebook (`notebooks/main.ipynb`) for the full writeup including methodology, results, and discussion.
