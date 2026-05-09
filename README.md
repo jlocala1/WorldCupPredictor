@@ -22,6 +22,9 @@ python src/models.py
 
 # 5. Monte Carlo simulate the 2026 World Cup (~14 min for n=100, ~140 min for n=1000)
 python src/simulate.py --iters 1000 --seed 42 --output models/sim_summary.csv
+
+# Optional: smoke-test the LLM baseline runner without API calls
+..\ml\Scripts\python.exe src\llm_baselines.py --provider heuristic --splits test --limit 5
 ```
 
 ## What the code does
@@ -87,6 +90,37 @@ done
 python src/simulate.py --iters 1000 --seed 42 --no-shootouts \
     --output models/sim_no_shootouts.csv
 ```
+
+### LLM baselines (`src/llm_baselines.py`)
+Runs three prompt-controlled LLM comparison tracks against the same
+`features.csv` splits as the ML models:
+
+- `feature_only_blind`: anonymized Team A/B, engineered features only.
+- `feature_plus_rag`: real teams, engineered features, and date-filtered
+  context retrieved only from project data.
+- `knowledge_only`: real fixture metadata only; no engineered features or RAG.
+
+Outputs are written to `models/llm_predictions_*.csv` plus
+`models/llm_eval_summary.json`. Probability order is the same as the ML code:
+`[away_win, draw, home_win]`.
+
+The runner auto-loads `.env` from the project root. For OpenAI GPT-5-family
+models it sends `max_completion_tokens` rather than deprecated `max_tokens`.
+
+```bash
+# Smoke test without network/API usage. This validates plumbing only.
+..\ml\Scripts\python.exe src\llm_baselines.py --provider heuristic --splits test --limit 5
+
+# Real OpenAI-compatible run. Put LLM_API_KEY / LLM_MODEL in .env first.
+..\ml\Scripts\python.exe src\llm_baselines.py --provider openai-compatible --splits val test
+
+# Include unplayed 2026 fixtures for qualitative predictions.
+..\ml\Scripts\python.exe src\llm_baselines.py --provider openai-compatible --splits val test --include-predict
+```
+
+The `knowledge_only` track is intentionally reported as a qualitative
+pretrained-knowledge prior, not as a leakage-free benchmark, because model
+pretraining may already encode famous historical outcomes.
 
 ## Train / val / test / predict splits
 
