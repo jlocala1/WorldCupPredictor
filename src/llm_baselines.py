@@ -296,7 +296,7 @@ class PromptBuilder:
             "Return only valid JSON with keys: p_away_win, p_draw, p_home_win, "
             "predicted_label, confidence, feature_factors, explanation, warnings. "
             "Probabilities must be numeric and sum to 1. Labels are 0=away_win, "
-            "1=draw, 2=home_win."
+            "1=draw, 2=home_win. Keep explanation under 80 words."
         )
         if profile == "feature_only_blind":
             user = self._feature_only_prompt(row)
@@ -631,6 +631,8 @@ def run_profile(
         messages = builder.build_messages(profile, row, rag_context=rag_context)
         key = cache.key(client.provider_name, model_name, profile, match_id, messages)
         raw_text = cache.get(key) if use_cache else None
+        if raw_text is not None and not parse_prediction(raw_text).valid:
+            raw_text = None
         if raw_text is None:
             raw_text = client.complete(messages, profile, row)
             parsed = parse_prediction(raw_text)
@@ -853,7 +855,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--api-key-env", default="LLM_API_KEY")
     parser.add_argument("--temperature", type=optional_float, default=optional_float(os.getenv("LLM_TEMPERATURE")))
-    parser.add_argument("--max-tokens", type=int, default=int(os.getenv("LLM_MAX_TOKENS", "700")))
+    parser.add_argument("--max-tokens", type=int, default=int(os.getenv("LLM_MAX_TOKENS", "2000")))
     parser.add_argument("--reasoning-effort", default=os.getenv("LLM_REASONING_EFFORT") or None)
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--sleep-seconds", type=float, default=0.0)

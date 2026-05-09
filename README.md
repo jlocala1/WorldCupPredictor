@@ -24,7 +24,7 @@ python src/models.py
 python src/simulate.py --iters 1000 --seed 42 --output models/sim_summary.csv
 
 # Optional: smoke-test the LLM baseline runner without API calls
-..\ml\Scripts\python.exe src\llm_baselines.py --provider heuristic --splits test --limit 5
+python src/llm_baselines.py --provider heuristic --splits test --limit 5
 ```
 
 ## What the code does
@@ -109,13 +109,13 @@ models it sends `max_completion_tokens` rather than deprecated `max_tokens`.
 
 ```bash
 # Smoke test without network/API usage. This validates plumbing only.
-..\ml\Scripts\python.exe src\llm_baselines.py --provider heuristic --splits test --limit 5
+python src/llm_baselines.py --provider heuristic --splits test --limit 5
 
 # Real OpenAI-compatible run. Put LLM_API_KEY / LLM_MODEL in .env first.
-..\ml\Scripts\python.exe src\llm_baselines.py --provider openai-compatible --splits val test
+python src/llm_baselines.py --provider openai-compatible --splits val test
 
 # Include unplayed 2026 fixtures for qualitative predictions.
-..\ml\Scripts\python.exe src\llm_baselines.py --provider openai-compatible --splits val test --include-predict
+python src/llm_baselines.py --provider openai-compatible --splits val test --include-predict
 ```
 
 The `knowledge_only` track is intentionally reported as a qualitative
